@@ -1,0 +1,39 @@
+# FastAPI and server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.36
+alembic==1.12.1
+psycopg[binary]>=3.2.2  # For Alembic migrations (Python 3.13 support)
+asyncpg>=0.30.0  # For async database operations (Python 3.13 support with pre-built wheels)
+
+# Task queue
+redis==5.0.1
+rq==1.15.1
+
+# Vector store
+qdrant-client==1.15.1  # Latest stable version
+
+# Graph database
+neo4j==5.14.1
+certifi>=2024.2.2
+
+# Configuration and validation
+pydantic>=2.9.0  # Updated for Python 3.13 support with pre-built wheels
+pydantic-settings>=2.6.0  # Updated for Python 3.13 support
+
+# Authentication and security
+python-jose[cryptography]==3.3.0
+cryptography==41.0.7
+passlib[bcrypt]==1.7.4
+
+# HTTP client
+httpx==0.25.2
+openai>=1.0.0  # OpenAI API client for embeddings
+
+# Utilities
+python-dotenv==1.0.0
+structlog==23.2.0
+
