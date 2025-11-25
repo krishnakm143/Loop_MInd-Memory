@@ -37,3 +37,6 @@ openai>=1.0.0  # OpenAI API client for embeddings
 python-dotenv==1.0.0
 structlog==23.2.0
 
+# LangCache (Semantic Caching)
+langcache>=0.1.0
+

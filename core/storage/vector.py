@@ -24,15 +24,40 @@ class VectorStore:
     async def create_collection(
         self, collection_name: str, vector_size: int, distance: Distance = Distance.COSINE
     ) -> bool:
-        """Create a new collection in Qdrant."""
+        """Create a new collection in Qdrant.
+        
+        Args:
+            collection_name: Name of the collection
+            vector_size: Size of the vectors (e.g., 1536 for text-embedding-3-small)
+            distance: Distance metric (COSINE, EUCLIDEAN, DOT)
+            
+        Returns:
+            True if collection was created or already exists, False on error
+        """
         try:
+            # Check if collection already exists
+            collections = self.client.get_collections()
+            existing_names = [col.name for col in collections.collections]
+            
+            if collection_name in existing_names:
+                return True  # Collection already exists
+            
+            # Create new collection
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=vector_size, distance=distance),
             )
             return True
-        except Exception:
-            # Collection might already exist
+        except Exception as e:
+            # Collection might already exist (race condition)
+            # Or other error - log and return False
+            import structlog
+            logger = structlog.get_logger()
+            logger.warning(
+                "Failed to create Qdrant collection",
+                collection_name=collection_name,
+                error=str(e),
+            )
             return False
 
     async def upsert_points(

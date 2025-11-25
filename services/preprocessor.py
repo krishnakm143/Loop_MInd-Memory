@@ -3,6 +3,7 @@
 import re
 import unicodedata
 from typing import Dict, Any, List, Optional
+from collections import Counter
 import structlog
 
 logger = structlog.get_logger()
@@ -262,6 +263,79 @@ class Preprocessor:
         
         return metadata
 
+    def extract_tags_from_content(self, text: str, max_tags: int = 10) -> List[str]:
+        """Extract tags/keywords from content using simple NLP.
+        
+        Args:
+            text: Text content to extract tags from
+            max_tags: Maximum number of tags to return
+            
+        Returns:
+            List of extracted tags (normalized, lowercase)
+        """
+        if not text:
+            return []
+        
+        # Common stop words to filter out
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+            'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that',
+            'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+            'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'her', 'its',
+            'our', 'their', 'what', 'which', 'who', 'whom', 'whose', 'where',
+            'when', 'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more',
+            'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
+            'same', 'so', 'than', 'too', 'very', 'just', 'now', 'then', 'here',
+            'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each',
+            'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not',
+            'only', 'own', 'same', 'so', 'than', 'too', 'very', 'can', 'will',
+            'just', 'don', 'should', 'now'
+        }
+        
+        # Normalize text
+        normalized = text.lower()
+        
+        # Remove URLs, emails, and special patterns
+        normalized = re.sub(r'https?://\S+|www\.\S+', '', normalized)
+        normalized = re.sub(r'\S+@\S+', '', normalized)
+        normalized = re.sub(r'[^\w\s]', ' ', normalized)
+        
+        # Extract words (2+ characters, alphanumeric)
+        words = re.findall(r'\b[a-z]{2,}\b', normalized)
+        
+        # Filter stop words and count frequency
+        meaningful_words = [w for w in words if w not in stop_words and len(w) >= 2]
+        
+        if not meaningful_words:
+            return []
+        
+        # Count word frequency
+        word_counts = Counter(meaningful_words)
+        
+        # Get top N most frequent words as tags
+        top_words = word_counts.most_common(max_tags)
+        
+        # Extract tags (normalize: lowercase, remove duplicates)
+        tags = [word for word, count in top_words if count >= 1]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_tags = []
+        for tag in tags:
+            if tag not in seen:
+                seen.add(tag)
+                unique_tags.append(tag)
+        
+        logger.debug(
+            "Tags extracted from content",
+            tag_count=len(unique_tags),
+            tags=unique_tags[:5]  # Log first 5
+        )
+        
+        return unique_tags[:max_tags]
+
 
 # Global preprocessor instance
 _preprocessor = Preprocessor()
@@ -297,7 +371,8 @@ async def preprocess_text(
             "chunks": [],
             "pii_redacted": False,
             "pii_counts": {},
-            "metadata": {}
+            "metadata": {},
+            "extracted_tags": []
         }
     
     # Step 1: Normalize text
@@ -325,12 +400,16 @@ async def preprocess_text(
     metadata = _preprocessor.extract_metadata(redacted_text)
     metadata["language"] = language
     
+    # Step 6: Extract tags from content
+    extracted_tags = _preprocessor.extract_tags_from_content(redacted_text)
+    
     logger.info(
         "Text preprocessed",
         char_count=len(normalized_text),
         chunk_count=len(chunks),
         pii_redacted=pii_redacted,
-        language=language
+        language=language,
+        extracted_tags_count=len(extracted_tags)
     )
     
     return {
@@ -340,4 +419,5 @@ async def preprocess_text(
         "pii_redacted": pii_redacted,
         "pii_counts": pii_counts,
         "metadata": metadata,
+        "extracted_tags": extracted_tags,
     }

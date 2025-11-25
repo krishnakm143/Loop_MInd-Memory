@@ -1,0 +1,13 @@
+Requirement already satisfied: sqlalchemy in d:\python313\lib\site-packages (2.0.23)
+Collecting sqlalchemy
+  Downloading sqlalchemy-2.0.44-cp313-cp313-win_amd64.whl.metadata (9.8 kB)
+Requirement already satisfied: greenlet>=1 in d:\python313\lib\site-packages (from sqlalchemy) (3.2.4)
+Requirement already satisfied: typing-extensions>=4.6.0 in d:\python313\lib\site-packages (from sqlalchemy) (4.15.0)
+Downloading sqlalchemy-2.0.44-cp313-cp313-win_amd64.whl (2.1 MB)
+   ----------------------------- 2.1/2.1 MB 8.7 MB/s  0:00:00
+Installing collected packages: sqlalchemy
+  Attempting uninstall: sqlalchemy
+    Found existing installation: SQLAlchemy 2.0.23
+    Uninstalling SQLAlchemy-2.0.23:
+      Successfully uninstalled SQLAlchemy-2.0.23
+Successfully installed sqlalchemy-2.0.44

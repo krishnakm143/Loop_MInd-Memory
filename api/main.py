@@ -14,7 +14,10 @@ if sys.platform == "win32":
 
 from api.config import settings
 from api.routes import health
-from api.routes.v1 import memories, query, actions
+from api.routes.v1 import (
+    memories, query, actions, auth,
+    analytics, monitoring, batch, history, export, webhooks
+)
 from core.db.session import close_db, init_db
 from core.storage.cache import CacheStore
 
@@ -77,9 +80,16 @@ app.add_middleware(
 
 # Include routers
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(memories.router)
 app.include_router(query.router)
 app.include_router(actions.router)
+app.include_router(analytics.router)
+app.include_router(monitoring.router)
+app.include_router(batch.router)
+app.include_router(history.router)
+app.include_router(export.router)
+app.include_router(webhooks.router)
 
 
 @app.get("/")

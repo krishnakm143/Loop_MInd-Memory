@@ -81,6 +81,66 @@ neuralstack-Backend/
 └── scripts/          # Utility scripts
 ```
 
+## Authentication
+
+The API uses JWT (JSON Web Tokens) for authentication. All endpoints except `/health` require a valid JWT token.
+
+### Generating a Token
+
+#### Option 1: Using the API Endpoint (Recommended for Swagger UI)
+
+1. **Quick Token Generation** (default user):
+   ```
+   GET /v1/auth/token/quick
+   ```
+   Returns a token with `user_id="test_user"` and `tenant_id="default_tenant"`.
+
+2. **Custom Token Generation**:
+   ```
+   POST /v1/auth/token
+   Body: {
+     "user_id": "your_user_id",
+     "tenant_id": "your_tenant_id"
+   }
+   ```
+
+#### Option 2: Using the Script
+
+```bash
+python scripts/generate_jwt_token.py --user-id my_user --tenant-id my_tenant
+```
+
+### Using the Token in Swagger UI
+
+1. Start the API server: `uvicorn api.main:app --reload`
+2. Open Swagger UI: `http://localhost:8000/docs`
+3. Click the **"Authorize"** button (lock icon) at the top right
+4. In the "Value" field, enter your token (without "Bearer " prefix)
+5. Click **"Authorize"**
+6. Click **"Close"**
+7. Now you can test all protected endpoints
+
+### Using the Token with curl
+
+```bash
+# Get a token first
+TOKEN=$(curl -X POST http://localhost:8000/v1/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "test_user", "tenant_id": "default_tenant"}' \
+  | jq -r '.access_token')
+
+# Use the token
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/v1/memories
+```
+
+### Token Configuration
+
+- **Secret Key**: Set via `JWT_SECRET_KEY` environment variable (default: `your-secret-key-change-in-production`)
+- **Algorithm**: HS256 (configurable via `JWT_ALGORITHM`)
+- **Expiration**: 30 minutes (configurable via `JWT_ACCESS_TOKEN_EXPIRE_MINUTES`)
+
+**⚠️ Important**: In production, use a strong secret key and implement proper authentication flow. The token generation endpoints are for development/testing only.
+
 ## API Endpoints
 
 ### Health Checks
@@ -89,6 +149,10 @@ neuralstack-Backend/
 - `GET /health/redis` - Redis connectivity
 - `GET /health/qdrant` - Qdrant connectivity
 - `GET /health/neo4j` - Neo4j connectivity
+
+### Authentication
+- `POST /v1/auth/token` - Generate JWT token (with custom user_id/tenant_id)
+- `GET /v1/auth/token/quick` - Generate quick test token (default values)
 
 ### Memory Management
 - `POST /v1/memories` - Ingest new memory
@@ -106,7 +170,29 @@ neuralstack-Backend/
    pip install -r requirements-dev.txt
    ```
 
-2. **Run tests**
+2. **Start services** (using Docker Compose)
+   ```bash
+   docker-compose up -d
+   ```
+   This starts PostgreSQL, Redis, Qdrant, and Neo4j.
+
+3. **Run database migrations**
+   ```bash
+   alembic upgrade head
+   ```
+
+4. **Start the API server**
+   ```bash
+   uvicorn api.main:app --reload
+   ```
+
+5. **Start the embedding worker** (in a separate terminal)
+   ```bash
+   python workers/embedding_worker.py
+   ```
+   The worker processes embedding jobs from the Redis queue and stores vectors in Qdrant.
+
+6. **Run tests**
    ```bash
    pytest
    ```

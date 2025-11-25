@@ -1,0 +1,67 @@
+Project foundation
+.gitignore - Python, Docker, IDE exclusions
+README.md - Project documentation with quick start
+requirements.txt - Core Python dependencies
+requirements-dev.txt - Development dependencies
+pyproject.toml - Project configuration with Black, Ruff, MyPy, Pytest
+.env.example - Environment variables template (exists but filtered)
+Cursor AI configuration
+.cursorrules - Project context, architecture overview, coding standards
+Docker setup
+docker-compose.yml - Postgres, Redis, Qdrant, Neo4j services
+Dockerfile - Multi-stage build for API service
+Configuration
+api/config.py - Pydantic settings for environment variables
+Database layer
+core/models/memory.py - Canonical memory model with JSONB
+core/models/audit.py - Append-only audit ledger model
+core/db/session.py - SQLAlchemy async session factory
+alembic.ini - Alembic configuration
+alembic/env.py - Alembic environment setup
+alembic/versions/001_initial_migration.py - Initial database migration
+Storage wrappers
+core/storage/vector.py - Qdrant client wrapper
+core/storage/graph.py - Neo4j client wrapper
+core/storage/cache.py - Redis cache wrapper
+FastAPI application
+api/main.py - FastAPI app with CORS, lifespan management
+api/dependencies.py - JWT auth, Ed25519 signature verification stubs
+api/routes/health.py - Health check endpoints for all services
+api/routes/v1/memories.py - Memory ingestion endpoint (stub)
+api/routes/v1/query.py - Query endpoint (stub)
+api/routes/v1/actions.py - NeuralGuard action submission (stub)
+Service stubs
+services/preprocessor.py - Text preprocessing (stub)
+services/antiviral.py - ANTIVIRAL detection (stub)
+services/embedding_router.py - Embedding routing (stub)
+services/sector_classifier.py - Sector classification (stub)
+services/hsg_builder.py - HSG graph builder (stub)
+services/hybrid_retriever.py - Hybrid retrieval (stub)
+services/context_assembler.py - Context assembly (stub)
+services/neuralguard.py - NeuralGuard policy engine (stub)
+services/action_broker.py - Action broker (stub)
+Workers and placeholders
+workers/embedding_worker.py - Embedding worker (stub)
+dynamics/ - Memory dynamics placeholders (Phase 2+)
+training/ - Adapter training placeholders (Phase 4+)
+Scripts
+scripts/init_db.py - Database initialization
+scripts/generate_keys.py - Ed25519 key pair generation
+Testing
+tests/conftest.py - Pytest fixtures with test database
+tests/test_health.py - Health check endpoint tests
+Next steps
+Install dependencies:
+   pip install -r requirements.txt   pip install -r requirements-dev.txt
+Set up environment:
+   cp .env.example .env   # Edit .env with your configuration
+Start services:
+   docker-compose up -d
+Initialize database:
+   python scripts/init_db.py   alembic upgrade head
+Generate Ed25519 keys (optional):
+   python scripts/generate_keys.py
+Run the API:
+   uvicorn api.main
+Run tests:
+   pytest

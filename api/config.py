@@ -122,6 +122,24 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    # LangCache (Semantic Caching)
+    langcache_api_key: Optional[str] = Field(
+        default=None, 
+        description="LangCache API key for semantic caching"
+    )
+    langcache_server_url: str = Field(
+        default="https://gcp-us-east4.langcache.redis.io",
+        description="LangCache server URL"
+    )
+    langcache_cache_id: str = Field(
+        default="a61f984fdf7b49f486541cb0d20f26c5",
+        description="LangCache cache ID"
+    )
+    enable_langcache: bool = Field(
+        default=True,
+        description="Enable LangCache semantic caching for queries"
+    )
+
     def __init__(self, **kwargs):
         """Initialize settings and parse CORS origins."""
         super().__init__(**kwargs)

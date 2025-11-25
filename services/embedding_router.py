@@ -72,12 +72,22 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
             logger.warning("OpenAI API key not set, falling back to placeholder")
             return [[0.0] * settings.embedding_dimension] * len(texts)
 
+        # Filter out empty strings - OpenAI API doesn't accept them
+        valid_texts = [text.strip() for text in texts if text and text.strip()]
+        
+        if not valid_texts:
+            logger.warning("No valid texts to embed (all empty or whitespace)")
+            return [[0.0] * settings.embedding_dimension] * len(texts)
+        
+        # Track which indices had valid text (for mapping back to original positions)
+        valid_indices = [i for i, text in enumerate(texts) if text and text.strip()]
+        
         # OpenAI supports up to 2048 inputs per request
         batch_size = min(settings.embedding_batch_size, 2048)
         all_embeddings = []
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+        for i in range(0, len(valid_texts), batch_size):
+            batch = valid_texts[i : i + batch_size]
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     response = await client.post(
@@ -93,12 +103,44 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
                     )
                     response.raise_for_status()
                     data = response.json()
+                    
+                    # Validate response structure
+                    if not data or "data" not in data:
+                        logger.error(
+                            "Invalid OpenAI API response structure",
+                            response_keys=list(data.keys()) if isinstance(data, dict) else "not a dict"
+                        )
+                        raise ValueError("Invalid API response: missing 'data' field")
+                    
                     batch_embeddings = [item["embedding"] for item in data["data"]]
                     all_embeddings.extend(batch_embeddings)
+                    
+            except httpx.HTTPStatusError as e:
+                # Log detailed error information
+                error_detail = str(e)
+                if e.response is not None:
+                    try:
+                        error_body = e.response.json()
+                        error_detail = f"{error_detail}. Response: {error_body}"
+                    except:
+                        error_detail = f"{error_detail}. Response text: {e.response.text[:200]}"
+                
+                logger.error(
+                    "Failed to get OpenAI embeddings batch - HTTP error",
+                    error=error_detail,
+                    status_code=e.response.status_code if e.response else None,
+                    batch_start=i,
+                    batch_size=len(batch),
+                )
+                # Fallback to placeholder embeddings for failed batch
+                all_embeddings.extend(
+                    [[0.0] * settings.embedding_dimension] * len(batch)
+                )
             except Exception as e:
                 logger.error(
-                    "Failed to get OpenAI embeddings batch",
+                    "Failed to get OpenAI embeddings batch - unexpected error",
                     error=str(e),
+                    error_type=type(e).__name__,
                     batch_start=i,
                     batch_size=len(batch),
                 )
@@ -107,7 +149,22 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
                     [[0.0] * settings.embedding_dimension] * len(batch)
                 )
 
-        return all_embeddings
+        # Map embeddings back to original positions (empty strings get placeholder embeddings)
+        result_embeddings = []
+        valid_idx = 0
+        for orig_idx, text in enumerate(texts):
+            if text and text.strip():
+                if valid_idx < len(all_embeddings):
+                    result_embeddings.append(all_embeddings[valid_idx])
+                    valid_idx += 1
+                else:
+                    # Fallback if mapping fails
+                    result_embeddings.append([0.0] * settings.embedding_dimension)
+            else:
+                # Empty string gets placeholder embedding
+                result_embeddings.append([0.0] * settings.embedding_dimension)
+
+        return result_embeddings
 
     else:
         # For other providers, call get_embedding in a loop (can be optimized later)

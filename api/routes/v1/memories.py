@@ -1,7 +1,17 @@
-"""Memory management endpoints."""
+"""Memory management endpoints.
+
+Implements the full memory ingestion pipeline:
+1. Preprocess and normalize text
+2. PII redaction
+3. ANTIVIRAL security scan
+4. Entity and triple extraction
+5. Sector classification
+6. HSG node creation with entity linking
+7. Embedding job enqueueing
+"""
 
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -15,6 +25,8 @@ from core.constants import MemoryType
 from services.preprocessor import preprocess_text
 from services.antiviral import scan_content
 from services.sector_classifier import classify_sector
+from services.extractor import extract_entities_and_triples
+from services.hsg_builder import build_hsg_node
 from api.config import settings
 import structlog
 
@@ -164,12 +176,36 @@ async def create_memory(
                 "breakdown": antiviral_result["breakdown"],
             }
         
+        # Merge user-provided tags with auto-extracted tags
+        user_tags = request.tags or []
+        extracted_tags = preprocessed.get("extracted_tags", [])
+        
+        # Combine and deduplicate tags (preserve user tags, add extracted tags)
+        all_tags = list(user_tags)  # Start with user tags
+        for tag in extracted_tags:
+            # Normalize tag for comparison (lowercase)
+            tag_lower = tag.lower().strip()
+            # Add if not already present (case-insensitive)
+            if tag_lower not in [t.lower().strip() for t in all_tags]:
+                all_tags.append(tag)
+        
+        # Remove empty tags and normalize
+        final_tags = [tag.strip() for tag in all_tags if tag.strip()]
+        
+        logger.info(
+            "Tags merged",
+            user_tags=user_tags,
+            extracted_tags=extracted_tags,
+            final_tags=final_tags,
+            memory_id="pending"
+        )
+        
         memory = Memory(
             tenant_id=tenant_id,
             user_id=user_id,
             type=sector_result["sector"],  # Auto-detected by sector classifier
             content=content_data,
-            tags=request.tags or [],
+            tags=final_tags,
             status=memory_status,
             importance=0.5,  # Default, will be updated by sector classifier
             trust_score=trust_score,
@@ -199,16 +235,127 @@ async def create_memory(
             pii_redacted=preprocessed["pii_redacted"]
         )
         
-        # TODO: Enqueue embedding job to Redis queue
-        # TODO: Generate embeddings
-        # TODO: Refine sector classification with embeddings (optional - can update memory.type if confidence improves)
-        # TODO: Build HSG nodes/edges
-        # Note: ANTIVIRAL scan and Sector Classifier are now integrated above
+        # Step 7: Enqueue embedding job to Redis queue
+        try:
+            from core.queue.job_queue import JobQueue
+            
+            queue = JobQueue()
+            if queue.health_check():
+                # Extract chunk texts from chunk dictionaries for the queue
+                # Chunks are stored as dicts with "text" field, but we need strings for embedding
+                chunk_texts = []
+                for chunk in preprocessed["chunks"]:
+                    if isinstance(chunk, dict):
+                        chunk_text = chunk.get("text", "")
+                        if chunk_text:
+                            chunk_texts.append(chunk_text)
+                    elif isinstance(chunk, str):
+                        chunk_texts.append(chunk)
+                
+                queue.enqueue_embedding_job(
+                    memory_id=str(memory.memory_id),
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    content=content_data,
+                    memory_type=sector_result["sector"],
+                    chunks=chunk_texts,  # Pass as list of strings
+                )
+                logger.info(
+                    "Embedding job enqueued",
+                    memory_id=str(memory.memory_id),
+                    sector=sector_result["sector"],
+                )
+            else:
+                logger.warning(
+                    "Redis queue not available, embedding job not enqueued",
+                    memory_id=str(memory.memory_id),
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to enqueue embedding job",
+                memory_id=str(memory.memory_id),
+                error=str(e),
+            )
+            # Don't fail the request if queue is unavailable
+        
+        # Step 8: Extract entities and triples for HSG
+        extraction_result = None
+        try:
+            extraction_result = await extract_entities_and_triples(
+                text=preprocessed["normalized_text"],
+                calculate_importance_score=True,
+            )
+            
+            logger.info(
+                "Entities and triples extracted",
+                memory_id=str(memory.memory_id),
+                entity_count=len(extraction_result.get("entities", [])),
+                triple_count=len(extraction_result.get("triples", [])),
+                calculated_importance=extraction_result.get("importance", 0.5),
+            )
+            
+            # Update importance if extraction suggests higher value
+            extracted_importance = extraction_result.get("importance", 0.5)
+            if extracted_importance > memory.importance:
+                memory.importance = extracted_importance
+                await session.commit()
+                
+        except Exception as e:
+            logger.warning(
+                "Entity extraction failed, continuing without HSG",
+                memory_id=str(memory.memory_id),
+                error=str(e),
+            )
+        
+        # Step 9: Build HSG node with entities
+        hsg_result = None
+        if extraction_result:
+            try:
+                hsg_result = await build_hsg_node(
+                    memory_id=str(memory.memory_id),
+                    content=content_data,
+                    sector=sector_result["sector"],
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    importance=memory.importance,
+                    trust_score=trust_score,
+                    provenance=[provenance_entry],
+                    extract_entities=False,  # Already extracted above
+                    link_related=True,
+                )
+                
+                # Manually link entities since we already extracted them
+                if hsg_result.get("success"):
+                    from services.hsg_builder import get_hsg_builder
+                    builder = get_hsg_builder()
+                    entities_linked = await builder.extract_and_link_entities(
+                        memory_id=str(memory.memory_id),
+                        entities=extraction_result.get("entities", []),
+                    )
+                    facts_linked = await builder.link_facts(
+                        memory_id=str(memory.memory_id),
+                        triples=extraction_result.get("triples", []),
+                    )
+                    
+                    logger.info(
+                        "HSG node built successfully",
+                        memory_id=str(memory.memory_id),
+                        entities_linked=entities_linked,
+                        facts_linked=facts_linked,
+                        related_linked=hsg_result.get("related_linked", 0),
+                    )
+                    
+            except Exception as e:
+                logger.warning(
+                    "HSG node creation failed, memory still saved",
+                    memory_id=str(memory.memory_id),
+                    error=str(e),
+                )
         
         return MemoryResponse(
             memory_id=str(memory.memory_id),
             status=memory.status,
-            message="Memory ingested and preprocessed successfully",
+            message="Memory ingested, preprocessed, and graph-indexed successfully",
         )
         
     except Exception as e:
