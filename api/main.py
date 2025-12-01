@@ -16,10 +16,11 @@ from api.config import settings
 from api.routes import health
 from api.routes.v1 import (
     memories, query, actions, auth,
-    analytics, monitoring, batch, history, export, webhooks
+    analytics, monitoring, batch, history, export, webhooks, temporal,
+    fast_query
 )
 from core.db.session import close_db, init_db
-from core.storage.cache import CacheStore
+from core.storage.connections import get_pool_manager, warmup_connections, shutdown_connections
 
 # Configure structured logging
 log_level = getattr(logging, settings.api_log_level.upper(), logging.INFO)
@@ -41,22 +42,26 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
     # Startup
     logger.info("Starting LoopMind_Memory HSG v4 API")
+    
     try:
         await init_db()
         logger.info("Database initialized")
     except Exception as e:
         logger.error("Failed to initialize database", error=str(e))
 
-    # Initialize cache connection
-    cache = CacheStore()
-    await cache.connect()
-    logger.info("Cache connected")
+    # Warm up all database connections
+    pool_manager = get_pool_manager()
+    warmup_results = await warmup_connections()
+    logger.info("Connection pools warmed up", results=warmup_results)
+    
+    # Start background health checks
+    await pool_manager.start_health_checks(interval_seconds=30)
 
     yield
 
     # Shutdown
     logger.info("Shutting down LoopMind_Memory HSG v4 API")
-    await cache.disconnect()
+    await shutdown_connections()
     await close_db()
     logger.info("Shutdown complete")
 
@@ -90,6 +95,8 @@ app.include_router(batch.router)
 app.include_router(history.router)
 app.include_router(export.router)
 app.include_router(webhooks.router)
+app.include_router(temporal.router)
+app.include_router(fast_query.router)
 
 
 @app.get("/")

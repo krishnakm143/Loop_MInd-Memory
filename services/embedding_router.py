@@ -1,8 +1,12 @@
-"""Embedding router service with OpenAI text-embedding-3-small support."""
+"""Embedding router service with OpenAI text-embedding-3-small support.
 
-from typing import List, Optional
+Includes performance caching to avoid redundant API calls.
+"""
+
+from typing import List, Optional, Dict
 import httpx
 from api.config import settings
+from core.storage.perf_cache import get_perf_cache
 import structlog
 
 logger = structlog.get_logger()
@@ -58,11 +62,14 @@ async def get_embedding(text: str) -> List[float]:
         return [0.0] * settings.embedding_dimension
 
 
-async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
+async def get_embeddings_batch(texts: List[str], use_cache: bool = True) -> List[List[float]]:
     """Get embeddings for a batch of texts using OpenAI.
+    
+    Uses performance cache to avoid redundant API calls.
 
     Args:
         texts: List of texts to embed
+        use_cache: Whether to use embedding cache (default: True)
 
     Returns:
         List of embedding vectors
@@ -72,12 +79,37 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
             logger.warning("OpenAI API key not set, falling back to placeholder")
             return [[0.0] * settings.embedding_dimension] * len(texts)
 
+        # Check cache for existing embeddings
+        cache = get_perf_cache()
+        cached_embeddings: Dict[int, List[float]] = {}
+        
+        if use_cache:
+            cached_embeddings = await cache.get_embeddings_batch(texts)
+            
+            if len(cached_embeddings) == len(texts):
+                # All embeddings cached - return immediately
+                logger.debug("All embeddings from cache", count=len(texts))
+                return [cached_embeddings[i] for i in range(len(texts))]
+
         # Filter out empty strings - OpenAI API doesn't accept them
-        valid_texts = [text.strip() for text in texts if text and text.strip()]
+        # Also skip texts that are already cached
+        valid_texts = []
+        valid_indices = []
+        
+        for i, text in enumerate(texts):
+            if i in cached_embeddings:
+                continue  # Already cached
+            if text and text.strip():
+                valid_texts.append(text.strip())
+                valid_indices.append(i)
         
         if not valid_texts:
-            logger.warning("No valid texts to embed (all empty or whitespace)")
-            return [[0.0] * settings.embedding_dimension] * len(texts)
+            logger.debug("All valid texts from cache or empty")
+            # Return cached + placeholders for empty
+            return [
+                cached_embeddings.get(i, [0.0] * settings.embedding_dimension)
+                for i in range(len(texts))
+            ]
         
         # Track which indices had valid text (for mapping back to original positions)
         valid_indices = [i for i, text in enumerate(texts) if text and text.strip()]
@@ -149,13 +181,20 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
                     [[0.0] * settings.embedding_dimension] * len(batch)
                 )
 
-        # Map embeddings back to original positions (empty strings get placeholder embeddings)
+        # Map embeddings back to original positions
         result_embeddings = []
+        new_embeddings_map: Dict[int, List[float]] = {}  # For caching
+        
         valid_idx = 0
         for orig_idx, text in enumerate(texts):
-            if text and text.strip():
+            if orig_idx in cached_embeddings:
+                # Use cached embedding
+                result_embeddings.append(cached_embeddings[orig_idx])
+            elif text and text.strip():
                 if valid_idx < len(all_embeddings):
-                    result_embeddings.append(all_embeddings[valid_idx])
+                    embedding = all_embeddings[valid_idx]
+                    result_embeddings.append(embedding)
+                    new_embeddings_map[orig_idx] = embedding
                     valid_idx += 1
                 else:
                     # Fallback if mapping fails
@@ -163,6 +202,17 @@ async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
             else:
                 # Empty string gets placeholder embedding
                 result_embeddings.append([0.0] * settings.embedding_dimension)
+        
+        # Cache new embeddings for future use
+        if use_cache and new_embeddings_map:
+            texts_to_cache = [texts[i] for i in new_embeddings_map.keys()]
+            embeddings_to_cache = [new_embeddings_map[i] for i in new_embeddings_map.keys()]
+            await cache.set_embeddings_batch(texts_to_cache, embeddings_to_cache)
+            logger.debug(
+                "Cached new embeddings",
+                cached_count=len(new_embeddings_map),
+                from_cache=len(cached_embeddings),
+            )
 
         return result_embeddings
 

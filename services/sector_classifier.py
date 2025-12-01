@@ -1,8 +1,12 @@
-"""Sector classification service for memory type detection."""
+"""Sector classification service for memory type detection.
+
+Includes performance caching to avoid redundant classification.
+"""
 
 import re
 from typing import Dict, Any, List, Optional
 from core.constants import MemoryType
+from core.storage.perf_cache import get_perf_cache
 import structlog
 
 logger = structlog.get_logger()
@@ -151,16 +155,19 @@ _classifier = SectorClassifier()
 async def classify_sector(
     content: str,
     embedding: Optional[List[float]] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    use_cache: bool = True,
 ) -> Dict[str, Any]:
     """Classify memory into sector (episodic, semantic, emotional, procedural, workspace).
     
     Uses rule-first approach with optional embedding-based refinement.
+    Includes caching to avoid redundant classification.
     
     Args:
         content: Memory content to classify
         embedding: Optional embedding vector (for future ML-based classification)
         metadata: Optional metadata (can provide hints like tags, content_type)
+        use_cache: Whether to use classification cache (default: True)
         
     Returns:
         Classification result with:
@@ -177,18 +184,29 @@ async def classify_sector(
             "method": "default",
         }
     
+    # Check cache first
+    cache = get_perf_cache()
+    if use_cache:
+        cached = await cache.get_classification(content)
+        if cached:
+            cached["method"] = "cached"
+            return cached
+    
     # Use metadata hints if available
     if metadata:
         # Check if content_type suggests a sector
         content_type = metadata.get("content_type", "")
         if content_type == "code":
             # Code is likely workspace-related
-            return {
+            result = {
                 "sector": MemoryType.WORKSPACE.value,
                 "confidence": 0.7,
                 "scores": {MemoryType.WORKSPACE.value: 0.7},
                 "method": "metadata_hint",
             }
+            if use_cache:
+                await cache.set_classification(content, result)
+            return result
     
     # Rule-based classification (primary method)
     result = _classifier.rule_based_classify(content)
@@ -199,6 +217,10 @@ async def classify_sector(
         # TODO: Use embedding for refinement
         # For now, embedding-based classification is a stub
         pass
+    
+    # Cache the result
+    if use_cache:
+        await cache.set_classification(content, result)
     
     logger.info(
         "Sector classified",

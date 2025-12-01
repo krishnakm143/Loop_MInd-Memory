@@ -3,6 +3,7 @@
 Extracts structured information from memory content:
 - Named entities (people, locations, dates, concepts, organizations)
 - Subject-predicate-object triples
+- Temporal facts with time bounds
 - Importance scoring based on entity density and specificity
 """
 
@@ -13,6 +14,15 @@ from collections import Counter
 import structlog
 
 logger = structlog.get_logger()
+
+
+# Temporal predicates that represent facts that can change over time
+TEMPORAL_PREDICATES = {
+    "is", "was", "are", "were", "has", "have", "had",
+    "works", "worked", "lives", "lived", "owns", "owned",
+    "manages", "managed", "leads", "led", "reports", "reported",
+    "costs", "cost", "earns", "earned", "makes", "made",
+}
 
 
 # Entity type patterns
@@ -288,6 +298,153 @@ class Extractor:
         
         return "related_to"
     
+    def extract_temporal_facts(
+        self,
+        text: str,
+        entities: List[Dict[str, Any]],
+        triples: List[Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """Extract temporal facts from triples and context.
+        
+        Identifies facts that represent time-bound truths that can evolve.
+        
+        Args:
+            text: Original text for context
+            entities: Extracted entities (for dates)
+            triples: Extracted triples
+            
+        Returns:
+            List of temporal fact candidates
+        """
+        if not triples:
+            return []
+        
+        temporal_facts = []
+        
+        # Extract date entities for temporal context
+        date_entities = [e for e in entities if e.get("type") == "date"]
+        reference_date = None
+        
+        # Parse first date found as reference
+        if date_entities:
+            date_str = date_entities[0].get("name", "")
+            reference_date = self._parse_date(date_str)
+        
+        for triple in triples:
+            subject = triple.get("subject", "")
+            predicate = triple.get("predicate", "")
+            obj = triple.get("object", "")
+            
+            if not (subject and predicate and obj):
+                continue
+            
+            # Check if this is a temporal predicate
+            predicate_words = predicate.replace("_", " ").split()
+            is_temporal = any(w in TEMPORAL_PREDICATES for w in predicate_words)
+            
+            # Normalize predicate to standard form
+            normalized_predicate = self._normalize_predicate(predicate)
+            
+            # Determine confidence based on extraction quality
+            confidence = 0.8 if is_temporal else 0.6
+            
+            temporal_facts.append({
+                "subject": subject,
+                "predicate": normalized_predicate,
+                "object": obj,
+                "valid_from": reference_date or datetime.utcnow(),
+                "confidence": confidence,
+                "is_temporal": is_temporal,
+                "source_type": "extracted",
+                "metadata": {
+                    "original_predicate": predicate,
+                    "extraction_method": "triple_to_fact",
+                },
+            })
+        
+        logger.debug(
+            "Temporal facts extracted",
+            triple_count=len(triples),
+            temporal_fact_count=len(temporal_facts),
+        )
+        
+        return temporal_facts
+    
+    def _parse_date(self, date_str: str) -> Optional[datetime]:
+        """Try to parse a date string into a datetime object.
+        
+        Args:
+            date_str: Date string to parse
+            
+        Returns:
+            Parsed datetime or None if parsing fails
+        """
+        # Handle relative dates
+        date_lower = date_str.lower().strip()
+        now = datetime.utcnow()
+        
+        if date_lower == "today":
+            return now
+        elif date_lower == "yesterday":
+            return now.replace(day=now.day - 1)
+        elif date_lower == "tomorrow":
+            return now.replace(day=now.day + 1)
+        
+        # Try common date formats
+        formats = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%B %d, %Y",
+            "%b %d, %Y",
+            "%B %d %Y",
+            "%b %d %Y",
+        ]
+        
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+        
+        return None
+    
+    def _normalize_predicate(self, predicate: str) -> str:
+        """Normalize predicate to a standard form.
+        
+        Args:
+            predicate: Raw predicate string
+            
+        Returns:
+            Normalized predicate (e.g., 'has_CEO', 'works_at')
+        """
+        predicate = predicate.lower().strip()
+        
+        # Map common variations to standard forms
+        mappings = {
+            "is": "is_a",
+            "was": "was_a",
+            "works": "works_at",
+            "worked": "worked_at",
+            "lives": "lives_in",
+            "lived": "lived_in",
+            "has": "has",
+            "had": "had",
+            "owns": "owns",
+            "owned": "owned",
+            "manages": "manages",
+            "managed": "managed",
+            "leads": "leads",
+            "led": "led",
+        }
+        
+        # Check for direct mapping
+        words = predicate.replace("_", " ").split()
+        if words and words[0] in mappings:
+            return mappings[words[0]] + ("_" + "_".join(words[1:]) if len(words) > 1 else "")
+        
+        return predicate.replace(" ", "_")
+    
     def calculate_importance(
         self,
         text: str,
@@ -357,15 +514,17 @@ _extractor = Extractor()
 async def extract_entities_and_triples(
     text: str,
     calculate_importance_score: bool = True,
+    extract_temporal: bool = True,
 ) -> Dict[str, Any]:
-    """Extract entities, triples, and importance from text.
+    """Extract entities, triples, temporal facts, and importance from text.
     
     Args:
         text: Text content to extract from
         calculate_importance_score: Whether to calculate importance
+        extract_temporal: Whether to extract temporal facts
         
     Returns:
-        Extraction results with entities, triples, and importance
+        Extraction results with entities, triples, temporal_facts, and importance
     """
     entities = _extractor.extract_entities(text)
     triples = _extractor.extract_triples(text)
@@ -374,9 +533,14 @@ async def extract_entities_and_triples(
     if calculate_importance_score:
         importance = _extractor.calculate_importance(text, entities, triples)
     
+    temporal_facts = []
+    if extract_temporal:
+        temporal_facts = _extractor.extract_temporal_facts(text, entities, triples)
+    
     return {
         "entities": entities,
         "triples": triples,
+        "temporal_facts": temporal_facts,
         "importance": importance,
     }
 
@@ -421,4 +585,27 @@ def calculate_importance(
         Importance score (0.0-1.0)
     """
     return _extractor.calculate_importance(text, entities, triples)
+
+
+async def extract_temporal_facts(
+    text: str,
+    entities: Optional[List[Dict[str, Any]]] = None,
+    triples: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    """Extract temporal facts from text.
+    
+    Args:
+        text: Text content
+        entities: Pre-extracted entities (optional, will be extracted if None)
+        triples: Pre-extracted triples (optional, will be extracted if None)
+        
+    Returns:
+        List of temporal fact dictionaries
+    """
+    if entities is None:
+        entities = _extractor.extract_entities(text)
+    if triples is None:
+        triples = _extractor.extract_triples(text)
+    
+    return _extractor.extract_temporal_facts(text, entities, triples)
 

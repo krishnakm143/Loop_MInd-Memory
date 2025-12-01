@@ -14,7 +14,7 @@ import uuid
 from typing import Dict, Any, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -45,6 +45,14 @@ class MemoryCreateRequest(BaseModel):
     content: str
     tags: list[str] = []
     metadata: Dict[str, Any] = {}
+    
+    @field_validator('content')
+    @classmethod
+    def content_must_not_be_empty(cls, v: str) -> str:
+        """Validate that content is not empty or whitespace only."""
+        if not v or not v.strip():
+            raise ValueError('Content cannot be empty or whitespace only')
+        return v
 
 
 class MemoryResponse(BaseModel):

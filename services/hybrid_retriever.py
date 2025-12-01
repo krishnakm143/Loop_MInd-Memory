@@ -1,22 +1,26 @@
 """Hybrid retrieval service for semantic memory search.
 
-Implements the 10-step retrieval pipeline:
+Implements the 10-step retrieval pipeline with parallel optimizations:
 1. Embed query using embedding router
 2. Route to sector(s) based on query
 3. Pre-filter by tenant/tags/date in metadata DB
-4. ANN search on Qdrant (top-128)
-5. Expand via graph (1-2 hops) to get coactivation neighbors
+4. ANN search on Qdrant (top-128) - PARALLEL across sectors
+5. Expand via graph (1-2 hops) to get coactivation neighbors - PARALLEL
 6. Merge candidate set (deduplicate)
 7. Score with hybrid formula
 8. Optional: GNN/cross-encoder rerank on top-64
 9. Assemble context with provenance trace
 10. Return top-K results
+
+Performance target: <100ms average response time via parallelization.
 """
 
 import math
-from typing import List, Dict, Any, Optional, Set
+import asyncio
+import time
+from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import structlog
 
 from core.storage.vector import VectorStore
@@ -27,6 +31,17 @@ from services.hsg_builder import update_coactivation
 from api.config import settings
 
 logger = structlog.get_logger()
+
+
+# Performance metrics
+@dataclass
+class RetrievalMetrics:
+    """Track retrieval performance metrics."""
+    embed_time_ms: float = 0.0
+    vector_search_time_ms: float = 0.0
+    graph_expand_time_ms: float = 0.0
+    rerank_time_ms: float = 0.0
+    total_time_ms: float = 0.0
 
 
 # Retrieval configuration
@@ -133,6 +148,84 @@ class HybridRetriever:
         
         return sectors
     
+    async def _search_single_sector(
+        self,
+        query_embedding: List[float],
+        tenant_id: str,
+        sector: str,
+        filters: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> List[RetrievalCandidate]:
+        """Search a single sector (helper for parallel search).
+        
+        Args:
+            query_embedding: Query embedding
+            tenant_id: Tenant ID filter
+            sector: Sector to search
+            filters: Additional metadata filters
+            limit: Maximum results
+            
+        Returns:
+            Candidates from this sector
+        """
+        collection_name = f"memories_{sector}"
+        candidates = []
+        
+        # Build filter
+        search_filter = {
+            "must": [
+                {"key": "tenant_id", "match": {"value": tenant_id}}
+            ]
+        }
+        
+        # Add custom filters
+        if filters:
+            for key, value in filters.items():
+                if key in ["tags", "user_id", "status"]:
+                    search_filter["must"].append({
+                        "key": key,
+                        "match": {"value": value}
+                    })
+        
+        try:
+            results = await self.vector_store.search(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                limit=limit,
+                filter=search_filter if search_filter["must"] else None,
+            )
+            
+            for result in results:
+                payload = result.get("payload", {})
+                memory_id = payload.get("memory_id")
+                
+                if not memory_id:
+                    continue
+                
+                # Parse created_at for recency calculation
+                created_at_str = payload.get("created_at")
+                recency_score = self._calculate_recency(created_at_str)
+                
+                candidate = RetrievalCandidate(
+                    memory_id=memory_id,
+                    vector_score=result.get("score", 0.0),
+                    recency_score=recency_score,
+                    trust_score=payload.get("trust_score", 0.5),
+                    importance=payload.get("importance", 0.5),
+                    sector=sector,
+                    source="vector",
+                )
+                candidates.append(candidate)
+                
+        except Exception as e:
+            logger.warning(
+                "Vector search failed for sector",
+                sector=sector,
+                error=str(e),
+            )
+        
+        return candidates
+
     async def vector_search(
         self,
         query_embedding: List[float],
@@ -141,7 +234,7 @@ class HybridRetriever:
         filters: Optional[Dict[str, Any]] = None,
         limit: int = DEFAULT_ANN_LIMIT,
     ) -> List[RetrievalCandidate]:
-        """Steps 3-4: Pre-filter and ANN search.
+        """Steps 3-4: Pre-filter and ANN search (PARALLEL across sectors).
         
         Args:
             query_embedding: Query embedding
@@ -153,82 +246,97 @@ class HybridRetriever:
         Returns:
             List of candidates from vector search
         """
+        # Calculate per-sector limit
+        per_sector_limit = max(20, limit // len(sectors))
+        
+        # Run searches in PARALLEL across all sectors
+        search_tasks = [
+            self._search_single_sector(
+                query_embedding=query_embedding,
+                tenant_id=tenant_id,
+                sector=sector,
+                filters=filters,
+                limit=per_sector_limit,
+            )
+            for sector in sectors
+        ]
+        
+        # Execute all searches concurrently
+        sector_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        
+        # Merge results and deduplicate
         candidates = []
         seen_ids: Set[str] = set()
         
-        for sector in sectors:
-            collection_name = f"memories_{sector}"
+        for result in sector_results:
+            if isinstance(result, Exception):
+                logger.warning("Sector search returned exception", error=str(result))
+                continue
             
-            # Build filter
-            search_filter = {
-                "must": [
-                    {"key": "tenant_id", "match": {"value": tenant_id}}
-                ]
-            }
-            
-            # Add custom filters
-            if filters:
-                for key, value in filters.items():
-                    if key in ["tags", "user_id", "status"]:
-                        search_filter["must"].append({
-                            "key": key,
-                            "match": {"value": value}
-                        })
-            
-            try:
-                results = await self.vector_store.search(
-                    collection_name=collection_name,
-                    query_vector=query_embedding,
-                    limit=limit // len(sectors),  # Distribute limit across sectors
-                    filter=search_filter if search_filter["must"] else None,
-                )
-                
-                for result in results:
-                    payload = result.get("payload", {})
-                    memory_id = payload.get("memory_id")
-                    
-                    if not memory_id or memory_id in seen_ids:
-                        continue
-                    
-                    seen_ids.add(memory_id)
-                    
-                    # Parse created_at for recency calculation
-                    created_at_str = payload.get("created_at")
-                    recency_score = self._calculate_recency(created_at_str)
-                    
-                    candidate = RetrievalCandidate(
-                        memory_id=memory_id,
-                        vector_score=result.get("score", 0.0),
-                        recency_score=recency_score,
-                        trust_score=payload.get("trust_score", 0.5),
-                        importance=payload.get("importance", 0.5),
-                        sector=sector,
-                        source="vector",
-                    )
+            for candidate in result:
+                if candidate.memory_id not in seen_ids:
+                    seen_ids.add(candidate.memory_id)
                     candidates.append(candidate)
-                    
-            except Exception as e:
-                logger.warning(
-                    "Vector search failed for sector",
-                    sector=sector,
-                    error=str(e),
-                )
         
         logger.debug(
-            "Vector search completed",
+            "Vector search completed (parallel)",
             sectors=sectors,
             candidate_count=len(candidates),
         )
         
         return candidates
     
+    async def _expand_single_node(
+        self,
+        memory_id: str,
+        hops: int,
+        limit: int,
+    ) -> List[Tuple[str, float, str, str]]:
+        """Expand a single node via graph (helper for parallel expansion).
+        
+        Args:
+            memory_id: Memory ID to expand from
+            hops: Number of hops
+            limit: Maximum neighbors to return
+            
+        Returns:
+            List of (neighbor_id, weight, sector, rel_type) tuples
+        """
+        try:
+            neighbors = await self.graph_store.get_neighbors(
+                memory_id=memory_id,
+                rel_types=["RELATED_TO", "COACTIVATES_WITH"],
+                hops=hops,
+                limit=limit,
+            )
+            
+            results = []
+            for neighbor in neighbors:
+                neighbor_id = neighbor.get("neighbor_id")
+                if neighbor_id and neighbor.get("neighbor_type") == "Memory":
+                    results.append((
+                        str(neighbor_id),
+                        neighbor.get("weight", 0.5),
+                        neighbor.get("sector", "semantic"),
+                        neighbor.get("rel_type", ""),
+                    ))
+            return results
+            
+        except Exception as e:
+            logger.warning(
+                "Graph expansion failed for node",
+                memory_id=memory_id,
+                error=str(e),
+            )
+            return []
+
     async def expand_via_graph(
         self,
         candidates: List[RetrievalCandidate],
         hops: int = DEFAULT_GRAPH_HOPS,
         max_expansion: int = 50,
     ) -> List[RetrievalCandidate]:
-        """Step 5: Expand candidates via graph neighbors.
+        """Step 5: Expand candidates via graph neighbors (PARALLEL).
         
         Args:
             candidates: Initial candidates from vector search
@@ -241,64 +349,55 @@ class HybridRetriever:
         if not candidates:
             return candidates
         
-        # Get memory IDs from top candidates
-        top_ids = [c.memory_id for c in candidates[:20]]  # Expand from top 20
+        # Get memory IDs from top candidates (expand from top 20)
+        top_ids = [c.memory_id for c in candidates[:20]]
         seen_ids = {c.memory_id for c in candidates}
         
+        # Run graph expansions in PARALLEL
+        expansion_tasks = [
+            self._expand_single_node(
+                memory_id=memory_id,
+                hops=hops,
+                limit=10,
+            )
+            for memory_id in top_ids
+        ]
+        
+        # Execute all expansions concurrently
+        expansion_results = await asyncio.gather(*expansion_tasks, return_exceptions=True)
+        
+        # Collect expanded candidates
         expanded_candidates = []
         
-        for memory_id in top_ids:
-            try:
-                neighbors = await self.graph_store.get_neighbors(
-                    memory_id=memory_id,
-                    rel_types=["RELATED_TO", "COACTIVATES_WITH"],
-                    hops=hops,
-                    limit=10,
-                )
+        for result in expansion_results:
+            if isinstance(result, Exception):
+                continue
+            
+            for neighbor_id, weight, sector, rel_type in result:
+                if neighbor_id in seen_ids:
+                    continue
                 
-                for neighbor in neighbors:
-                    neighbor_id = neighbor.get("neighbor_id")
-                    
-                    if not neighbor_id or neighbor_id in seen_ids:
-                        continue
-                    
-                    # Only consider Memory nodes
-                    if neighbor.get("neighbor_type") != "Memory":
-                        continue
-                    
-                    seen_ids.add(neighbor_id)
-                    
-                    # Graph score based on edge weight and relationship type
-                    weight = neighbor.get("weight", 0.5)
-                    rel_type = neighbor.get("rel_type", "")
-                    
-                    # Boost coactivation relationships
-                    if rel_type == "COACTIVATES_WITH":
-                        weight *= 1.2
-                    
-                    candidate = RetrievalCandidate(
-                        memory_id=str(neighbor_id),
-                        graph_score=weight,
-                        sector=neighbor.get("sector", "semantic"),
-                        source="graph",
-                    )
-                    expanded_candidates.append(candidate)
-                    
-                    if len(expanded_candidates) >= max_expansion:
-                        break
-                        
-            except Exception as e:
-                logger.warning(
-                    "Graph expansion failed",
-                    memory_id=memory_id,
-                    error=str(e),
+                seen_ids.add(neighbor_id)
+                
+                # Boost coactivation relationships
+                score = weight * 1.2 if rel_type == "COACTIVATES_WITH" else weight
+                
+                candidate = RetrievalCandidate(
+                    memory_id=neighbor_id,
+                    graph_score=score,
+                    sector=sector,
+                    source="graph",
                 )
+                expanded_candidates.append(candidate)
+                
+                if len(expanded_candidates) >= max_expansion:
+                    break
             
             if len(expanded_candidates) >= max_expansion:
                 break
         
         logger.debug(
-            "Graph expansion completed",
+            "Graph expansion completed (parallel)",
             original_count=len(candidates),
             expanded_count=len(expanded_candidates),
         )
@@ -504,8 +603,11 @@ async def hybrid_retrieve(
     limit: int = DEFAULT_FINAL_LIMIT,
     graph_hops: int = DEFAULT_GRAPH_HOPS,
     include_context: bool = True,
+    include_metrics: bool = False,
 ) -> Dict[str, Any]:
-    """Full hybrid retrieval pipeline.
+    """Full hybrid retrieval pipeline with parallel optimizations.
+    
+    Target: <100ms average response time.
     
     Args:
         query: Query text
@@ -516,14 +618,24 @@ async def hybrid_retrieve(
         limit: Maximum results
         graph_hops: Graph expansion hops (1 or 2)
         include_context: Include graph context in results
+        include_metrics: Include timing metrics in response
         
     Returns:
-        Retrieval results with metadata
+        Retrieval results with metadata and optional timing metrics
     """
     retriever = get_retriever()
+    metrics = RetrievalMetrics()
+    start_time = time.perf_counter()
     
-    # Step 1: Embed query
-    query_embedding = await retriever.embed_query(query)
+    # Steps 1-2: Embed query AND route to sectors IN PARALLEL
+    embed_start = time.perf_counter()
+    
+    embed_task = retriever.embed_query(query)
+    route_task = retriever.route_to_sectors(query, sectors)
+    
+    query_embedding, target_sectors = await asyncio.gather(embed_task, route_task)
+    
+    metrics.embed_time_ms = (time.perf_counter() - embed_start) * 1000
     
     if not query_embedding:
         logger.error("Failed to embed query")
@@ -534,15 +646,14 @@ async def hybrid_retrieve(
             "sectors_searched": [],
         }
     
-    # Step 2: Route to sectors
-    target_sectors = await retriever.route_to_sectors(query, sectors)
-    
     # Build filters
     search_filters = filters or {}
     if user_id:
         search_filters["user_id"] = user_id
     
-    # Steps 3-4: Vector search
+    # Steps 3-4: Vector search (PARALLEL across sectors)
+    vector_start = time.perf_counter()
+    
     candidates = await retriever.vector_search(
         query_embedding=query_embedding,
         tenant_id=tenant_id,
@@ -551,17 +662,25 @@ async def hybrid_retrieve(
         limit=DEFAULT_ANN_LIMIT,
     )
     
-    # Step 5: Graph expansion
+    metrics.vector_search_time_ms = (time.perf_counter() - vector_start) * 1000
+    
+    # Step 5: Graph expansion (PARALLEL across memory IDs)
+    graph_start = time.perf_counter()
+    
     candidates = await retriever.expand_via_graph(
         candidates,
         hops=graph_hops,
     )
     
+    metrics.graph_expand_time_ms = (time.perf_counter() - graph_start) * 1000
+    
     # Step 6: Merge and deduplicate
     candidates = retriever.merge_and_deduplicate(candidates)
     
     # Steps 7-8: Hybrid rerank
+    rerank_start = time.perf_counter()
     candidates = retriever.hybrid_rerank(candidates)
+    metrics.rerank_time_ms = (time.perf_counter() - rerank_start) * 1000
     
     # Steps 9-10: Assemble results
     results = await retriever.assemble_results(
@@ -570,13 +689,13 @@ async def hybrid_retrieve(
         include_context=include_context,
     )
     
-    # Update coactivation for top results
+    # Update coactivation for top results (fire and forget - don't wait)
     if len(results) >= 2:
         result_ids = [r["memory_id"] for r in results[:5]]
-        try:
-            await update_coactivation(result_ids)
-        except Exception as e:
-            logger.warning("Failed to update coactivation", error=str(e))
+        # Don't await - run in background to not block response
+        asyncio.create_task(_safe_update_coactivation(result_ids))
+    
+    metrics.total_time_ms = (time.perf_counter() - start_time) * 1000
     
     logger.info(
         "Hybrid retrieval completed",
@@ -584,14 +703,37 @@ async def hybrid_retrieve(
         sectors=target_sectors,
         total_candidates=len(candidates),
         results_returned=len(results),
+        total_time_ms=round(metrics.total_time_ms, 2),
+        embed_time_ms=round(metrics.embed_time_ms, 2),
+        vector_time_ms=round(metrics.vector_search_time_ms, 2),
+        graph_time_ms=round(metrics.graph_expand_time_ms, 2),
     )
     
-    return {
+    response = {
         "results": results,
         "total": len(candidates),
         "query": query,
         "sectors_searched": target_sectors,
     }
+    
+    if include_metrics:
+        response["metrics"] = {
+            "embed_ms": round(metrics.embed_time_ms, 2),
+            "vector_search_ms": round(metrics.vector_search_time_ms, 2),
+            "graph_expand_ms": round(metrics.graph_expand_time_ms, 2),
+            "rerank_ms": round(metrics.rerank_time_ms, 2),
+            "total_ms": round(metrics.total_time_ms, 2),
+        }
+    
+    return response
+
+
+async def _safe_update_coactivation(memory_ids: List[str]):
+    """Safely update coactivation in background (fire-and-forget)."""
+    try:
+        await update_coactivation(memory_ids)
+    except Exception as e:
+        logger.warning("Background coactivation update failed", error=str(e))
 
 
 async def search_by_embedding(

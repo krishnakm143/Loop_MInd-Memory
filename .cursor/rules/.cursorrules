@@ -1,0 +1,212 @@
+# LoopMind_Memory HSG v4 Backend - Cursor AI Project Instructions
+
+## Project Context
+
+This is the backend implementation for LoopMind_Memory HSG v4, a production-grade memory platform that provides long-term, explainable, and safe memory for agents and applications.
+
+### Architecture Overview
+
+The system follows this data flow:
+1. **Client** → API Gateway (FastAPI)
+2. **Preprocessor** → Text normalization, PII redaction, chunking
+3. **ANTIVIRAL** → Prompt injection and poisoning detection
+4. **Embedding Router** → Local ONNX or cloud embeddings (OpenAI/Azure/Gemini)
+5. **Sector Classifier** → Routes to episodic/semantic/emotional/procedural/workspace sectors
+6. **HSG Builder** → Constructs hierarchical semantic graph nodes and edges
+7. **Storage Layer**:
+   - Vector DB (Qdrant) - Hot HNSW indices per sector
+   - Graph DB (Neo4j) - Relations and traversal
+   - Metadata DB (Postgres) - Canonical memory with JSONB
+   - Cache (Redis) - Short-term caching
+   - Queue (Redis) - Task queue
+   - Audit Ledger - Append-only with signatures
+8. **Hybrid Retriever** → Vector + graph + metadata filtering
+9. **Context Assembler** → Assembles snippets with provenance
+10. **LLM Memory Reasoner** → RAG + chain-of-thought
+11. **NeuralGuard** → Policy engine + simulator for action approval
+12. **Action Broker** → Executes approved actions via connectors
+
+### Additional Components
+
+- **Memory Dynamics**: Decay Engine, Coactivation Diffusion, GNN Reranker
+- **Adapter Training**: Candidate Generator → Trainer → Sandbox Validator → Canary Orchestrator → Adapter Library
+- **Ops**: Kubernetes, ArgoCD, Prometheus, Grafana, Loki, Sentry
+
+## Coding Standards
+
+### Python Style
+
+- Use Python 3.10+ features (type hints, async/await)
+- Follow PEP 8 with Black formatting (line length 100)
+- Use type hints for all function parameters and return values
+- Prefer async/await over sync code for I/O operations
+- Use `structlog` for structured logging
+
+### Code Organization
+
+- **api/**: FastAPI routes, dependencies, configuration
+- **core/**: Database models, session management, storage wrappers
+- **services/**: Business logic services (preprocessor, antiviral, etc.)
+- **workers/**: Background task workers
+- **dynamics/**: Memory dynamics (decay, coactivation, GNN)
+- **training/**: Adapter training pipeline
+- **tests/**: Test suite with pytest
+
+### Key Patterns
+
+1. **Dependency Injection**: Use FastAPI's dependency system
+   ```python
+   async def get_db_session() -> AsyncSession:
+       async with get_async_session() as session:
+           yield session
+   ```
+
+2. **Error Handling**: Use custom exceptions and proper HTTP status codes
+   ```python
+   from fastapi import HTTPException
+   raise HTTPException(status_code=404, detail="Memory not found")
+   ```
+
+3. **Configuration**: Use pydantic-settings for environment variables
+   ```python
+   from pydantic_settings import BaseSettings
+   class Settings(BaseSettings):
+       database_url: str
+   ```
+
+4. **Database Models**: Use SQLAlchemy 2.0 async with type hints
+   ```python
+   from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+   class Base(DeclarativeBase): pass
+   ```
+
+5. **Async Context Managers**: For database sessions and connections
+   ```python
+   async with get_async_session() as session:
+       result = await session.execute(select(Memory))
+   ```
+
+### Type Hints
+
+- Always use type hints for function signatures
+- Use `Optional[T]` or `T | None` for nullable values
+- Use `List[T]`, `Dict[K, V]` from `typing` (or built-in `list`, `dict` in Python 3.9+)
+- Use `AsyncGenerator` for async generators
+- Use `Annotated` for FastAPI dependencies
+
+### Documentation
+
+- Add docstrings to all public functions and classes
+- Use Google-style docstrings:
+  ```python
+  def process_memory(content: str) -> Memory:
+      """Process and ingest a memory.
+      
+      Args:
+          content: Raw memory content to process
+          
+      Returns:
+          Created Memory object
+          
+      Raises:
+          ValidationError: If content fails validation
+      """
+  ```
+
+### Testing
+
+- Write tests for all services and endpoints
+- Use pytest with async support (`pytest-asyncio`)
+- Mock external dependencies (vector DB, graph DB, etc.)
+- Test error cases and edge conditions
+
+### Security
+
+- Never log sensitive data (passwords, tokens, PII)
+- Use environment variables for secrets
+- Validate all inputs with Pydantic models
+- Use Ed25519 signatures for agent actions
+- Implement rate limiting on API endpoints
+
+### Performance
+
+- Use async/await for all I/O operations
+- Batch operations when possible (embeddings, database queries)
+- Cache frequently accessed data in Redis
+- Use connection pooling for databases
+- Optimize vector search with proper HNSW parameters
+
+## Problem-Solving Philosophy
+
+**CRITICAL: Always solve root causes, never apply patches.**
+
+- **Root Cause Analysis**: When encountering bugs, errors, or issues, always investigate and understand the underlying root cause before implementing a solution
+- **No Band-Aid Fixes**: Avoid workarounds, temporary fixes, or patches that mask symptoms without addressing the fundamental problem
+- **Systematic Approach**: 
+  - Identify why the problem exists (not just what the problem is)
+  - Understand the system architecture and data flow
+  - Fix the root cause at its source
+  - Ensure the solution prevents similar issues from occurring
+- **Long-term Thinking**: Solutions should be maintainable, scalable, and prevent recurrence
+- **When in Doubt**: If the root cause is unclear, investigate further rather than applying a quick fix. Ask questions, trace execution paths, examine logs, and understand the full context
+
+**Examples:**
+- ❌ **Bad**: Adding try-except to silence an error without understanding why it occurs
+- ✅ **Good**: Identifying why the error occurs (e.g., missing validation, race condition) and fixing the underlying issue
+- ❌ **Bad**: Adding a delay to work around a race condition
+- ✅ **Good**: Implementing proper synchronization or state management to eliminate the race condition
+- ❌ **Bad**: Catching and ignoring exceptions to make code "work"
+- ✅ **Good**: Fixing the code path that causes the exception in the first place
+
+## File Naming
+
+- Use snake_case for Python files
+- Use descriptive names: `hybrid_retriever.py` not `retriever.py`
+- Group related functionality in modules
+
+## Import Organization
+
+1. Standard library imports
+2. Third-party imports
+3. Local application imports
+
+Use absolute imports from project root.
+
+## Error Messages
+
+- Be specific and actionable
+- Include relevant context (IDs, timestamps)
+- Use structured logging with context
+
+## Database
+
+- Use Alembic for migrations
+- Always use transactions for multi-step operations
+- Use async SQLAlchemy 2.0 syntax
+- Index frequently queried columns
+- Use JSONB for flexible schema (Postgres)
+
+## API Design
+
+- Use RESTful conventions
+- Version APIs (`/v1/`, `/v2/`)
+- Return consistent error formats
+- Use Pydantic models for request/response validation
+- Document endpoints with OpenAPI
+
+## When Adding New Features
+
+1. Create service module in `services/`
+2. Add database models in `core/models/` if needed
+3. Create API routes in `api/routes/v1/`
+4. Add tests in `tests/`
+5. Update documentation in README.md
+6. Add environment variables to `.env.example`
+
+## Common Tasks
+
+- **Adding a new endpoint**: Create route in `api/routes/v1/`, add to `api/main.py`
+- **Adding a database model**: Create in `core/models/`, create Alembic migration
+- **Adding a service**: Create in `services/`, add to dependency injection
+- **Adding a worker**: Create in `workers/`, register in queue system
+
